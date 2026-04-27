@@ -1,0 +1,201 @@
+---
+title: "Geyer Process Fitting for Spatial Point Patterns"
+author: "Shruti"
+date: "30/01/2023"
+output: html_document
+---
+
+## Overview
+
+This script fits a **Geyer saturation process** to spatial point pattern data
+for the cell type `Mp2p6n` across multiple tissue samples. For each sample, it:
+
+1. Loads a marked point pattern (`.rds` file)
+2. Subsets to the `Mp2p6n` cell type
+3. Estimates the optimal interaction radius via the **L-function**
+4. Fits a **Geyer saturation model** using profile pseudolikelihood
+5. Extracts and saves key model parameters to a CSV
+
+---
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# ============================================================
+# DEPENDENCIES
+# ============================================================
+library(spatstat)  # Spatial statistics and point process modelling
+```
+
+---
+
+## Load Files
+
+```{r load-files}
+# ============================================================
+# FILE LOADING
+# ============================================================
+# Read all .rds file paths from the target directory into a character vector.
+# full.names = TRUE returns absolute paths, making downstream reading portable.
+files <- list.files(
+  path       = "~/Downloads/BCA_RDS_new_total/",
+  full.names = TRUE
+)
+
+cat("Total files found:", length(files), "\n")
+```
+
+---
+
+## Fit Geyer Model
+
+```{r fit-geyer-model, warning=FALSE}
+# ============================================================
+# MAIN LOOP: Fit Geyer Saturation Process per file
+# ============================================================
+# Output data frame — columns are named at the end of the loop.
+# Pre-allocating with the expected column count (13) avoids repeated reallocation.
+df <- data.frame(matrix(ncol = 13, nrow = 0))
+
+for (file_index in seq_along(files)) {
+
+  # ----------------------------------------------------------
+  # 1. Load data
+  # ----------------------------------------------------------
+  file.name     <- files[file_index]
+  name.of.file  <- basename(file.name)   # Keep only filename for logging
+  MyObjectsData <- readRDS(file.name)    # Each RDS is a marked ppp object
+
+  # ----------------------------------------------------------
+  # 2. Subset to cell type of interest: "Mp2p6n"
+  # ----------------------------------------------------------
+  # Convert marks to factor (required by spatstat subset operations)
+  MyObjectsData$marks <- as.factor(MyObjectsData$marks)
+
+  # Retain only points belonging to the "Mp2p6n" mark class
+  p        <- subset(MyObjectsData, marks == "Mp2p6n", drop = TRUE)
+  p$marks  <- as.factor(p$marks)
+
+  print(name.of.file)
+
+  # ----------------------------------------------------------
+  # 3. Skip sparse patterns
+  # ----------------------------------------------------------
+  # Reliable estimation of second-order statistics and model fitting
+  # requires a minimum number of points. Files with fewer than 20
+  # points are skipped to avoid degenerate fits.
+  if (npoints(p) < 20) {
+    cat("  Skipping (fewer than 20 points):", name.of.file, "\n")
+    next
+  }
+
+  # ----------------------------------------------------------
+  # 4. Find optimal interaction radius via the L-function
+  # ----------------------------------------------------------
+  # The L-function (Besag's transformation of Ripley's K) detects clustering
+  # or regularity. The radius r that maximises |L(r) - r| indicates where
+  # spatial interaction is strongest — a data-driven choice for interaction range.
+
+  discrep <- function(r) {
+    abs(as.function(Lest(p))(r) - r)
+  }
+
+  res <- optimise(
+    discrep,
+    interval = c(0, 50),  # Search range in microns
+    maximum  = TRUE        # We want the maximiser, not the minimiser
+  )
+
+  cat("  Optimal L-function radius:", round(res$maximum, 2),
+      " | Discrepancy:", round(res$objective, 4), "\n")
+
+  # ----------------------------------------------------------
+  # 5. Profile pseudolikelihood over a grid of Geyer parameters
+  # ----------------------------------------------------------
+  # The Geyer saturation process extends the Strauss process by capping
+  # the pairwise interaction at a saturation count `sat`, allowing it to
+  # model both hard-core repulsion and clustered patterns.
+  #
+  # Parameter grid:
+  #   r   — interaction radius (1–30 µm in 0.5 µm steps)
+  #   sat — saturation threshold (1, 2, or 3 neighbours)
+  #
+  # profilepl() selects the (r, sat) pair that maximises the
+  # penalised pseudologlikelihood (aic = FALSE → use PL, not AIC).
+
+  rvals      <- seq(1, 30, by = 0.5)
+  param.grid <- expand.grid(
+    r   = rvals,
+    sat = seq(1, 3, by = 1)
+  )
+
+  fitp <- profilepl(param.grid, Geyer, p, aic = FALSE)
+
+  # ----------------------------------------------------------
+  # 6. Extract best-fitting model and key parameters
+  # ----------------------------------------------------------
+  X <- as.ppm(fitp)  # Best-fitting ppm object
+
+  # The Geyer model coefficient for log(gamma) is the second element.
+  # Exponentiating gives the interaction parameter gamma:
+  #   gamma > 1  -> clustering  (attraction)
+  #   gamma < 1  -> regularity  (inhibition)
+  #   gamma = 1  -> CSR         (no interaction)
+  gamma <- exp(X$coef[2])
+
+  # Retrieve the selected interaction radius and saturation parameter
+  interaction.distance <- fitp$fit$interaction$par[1]  # r   (microns)
+  saturation.parameter <- fitp$fit$interaction$par[2]  # sat
+
+  # ----------------------------------------------------------
+  # 7. Collect results for this file
+  # ----------------------------------------------------------
+  # Coefficients 1–7 cover the second-order polynomial trend surface:
+  # Intercept, x, y, x², x·y, y², log(Interaction)
+  fit.row <- c(
+    name.of.file,
+    as.numeric(X$coef[1:7]),           # Trend + interaction coefficients
+    as.numeric(gamma),                 # Interaction strength
+    as.numeric(res$maximum),           # Optimal L-function radius
+    as.numeric(res$objective),         # Max L-function discrepancy
+    as.numeric(interaction.distance),  # Geyer r
+    as.numeric(saturation.parameter)   # Geyer sat
+  )
+
+  df <- rbind(df, as.data.frame(t(fit.row), stringsAsFactors = FALSE))
+}
+
+# ============================================================
+# COLUMN NAMING
+# ============================================================
+names(df) <- c(
+  "Name",
+  "Intercept", "x", "y", "I(x^2)", "I(x*y)", "I(y^2)",
+  "log(Interaction)",
+  "gamma",
+  "Opt_L_radius",
+  "L_discrepancy",
+  "Interaction_Distance",
+  "Saturation_Parameter"
+)
+```
+
+---
+
+## Results
+
+```{r display-results}
+# ============================================================
+# DISPLAY & EXPORT
+# ============================================================
+print(df)
+
+# Save results to CSV (row.names = FALSE avoids a redundant integer index column)
+write.csv(
+  df,
+  file      = "~/OneDrive - National University of Singapore/PhD_code/Spatial project/Data/BCA/BCA_Mp2p6n_Geyer_bestPL.csv",
+  row.names = FALSE
+)
+
+cat("Results written to CSV successfully.\n")
+```
