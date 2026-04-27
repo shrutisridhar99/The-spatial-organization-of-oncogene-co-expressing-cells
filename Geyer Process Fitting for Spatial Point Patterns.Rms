@@ -199,3 +199,62 @@ write.csv(
 
 cat("Results written to CSV successfully.\n")
 ```
+
+---
+
+## Clustering Index Derivation
+
+```{r clustering-index}
+# ============================================================
+# CLUSTERING INDEX (CI) DERIVATION
+# ============================================================
+# CI integrates two complementary spatial statistics:
+#   - gamma: Geyer interaction parameter (model-based, directional)
+#   - L_discrepancy: max |L(r) - r| (empirical, non-parametric)
+#
+# CI = (gamma + L_discrepancy) / 2
+#
+# For patients with multiple cores, gamma and L_discrepancy are
+# averaged across cores before computing CI, giving a single
+# patient-level summary statistic.
+#
+# Higher CI -> more clustered
+# Lower CI  -> more dispersed
+
+# ── Load reference file mapping core names to patient IDs ──
+ref <- read.csv("BCA_Mp2p6n_Geyer_with_patients.csv")
+
+# ── Convert numeric columns ──
+df$gamma        <- as.numeric(df$gamma)
+df$L_discrepancy <- as.numeric(df$L_discrepancy)
+
+# ── Join patient IDs ──
+df <- df %>%
+  left_join(ref %>% select(Name, Patient), by = "Name")
+
+cat("Cores matched to patient ID:", sum(!is.na(df$Patient)),
+    "of", nrow(df), "\n")
+
+# ── Compute patient-level CI by averaging across cores ──
+# CI(av) = [L(1) + L(2) + ... + L(n) + gamma(1) + gamma(2) + ... + gamma(n)] / 2n
+df_ci <- df %>%
+  filter(!is.na(Patient)) %>%
+  group_by(Patient) %>%
+  summarise(
+    avg_gamma        = mean(gamma,         na.rm = TRUE),
+    avg_L_discrepancy = mean(L_discrepancy, na.rm = TRUE),
+    n_cores          = n(),
+    .groups          = "drop"
+  ) %>%
+  mutate(CI = (avg_gamma + avg_L_discrepancy) / 2)
+
+# ── Export ──
+write.csv(
+  df_ci,
+  file      = "BCA_Mp2p6n_CI_per_patient.csv",
+  row.names = FALSE
+)
+
+cat("CI derivation complete.\n")
+print(summary(df_ci$CI))
+```
