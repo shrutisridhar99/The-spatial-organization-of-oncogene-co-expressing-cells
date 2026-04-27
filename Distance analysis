@@ -1,0 +1,691 @@
+---
+title: "Cell Distance Analysis — Spatial Neighbourhood Enrichment (Δ%)"
+author: "Victoire Ringler"
+date: "2026-01-09"
+output: html_document
+---
+
+## Overview
+
+This pipeline quantifies the **spatial neighbourhood composition** of malignant
+B cells (stratified by M26 marker status) relative to other cell types in
+multiplexed imaging data. For each tissue core, it:
+
+1. Loads spatial point pattern data (`.rds` files) and annotates cells with
+   their type and M26 status
+2. Computes the **k-nearest neighbour (k=50) cell type proportions** for every
+   cell in each core
+3. Calculates **Δ%** — the difference between local neighbourhood proportions
+   and global core proportions — as a measure of spatial enrichment/depletion
+4. Compares neighbourhood composition between:
+   - **Primary vs Relapse** biopsies
+   - **Dispersed vs Clustered** tumour cores (tertile-stratified by clustering
+     index, Primary only)
+5. Exports summary statistics and publication-quality histograms as PDFs
+
+---
+
+## 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# ============================================================
+# DEPENDENCIES
+# ============================================================
+# BiocManager::install("zellkonverter")  # Uncomment to install
+# install.packages("readxl")             # Uncomment to install
+
+library(reticulate)
+use_condaenv("zellenv", required = TRUE)  # Python environment for zellkonverter
+
+library(readxl)           # Read Excel metadata files
+library(zellkonverter)    # Convert between AnnData and SingleCellExperiment
+library(spatstat.geom)    # Spatial point pattern geometry
+library(spatstat.explore) # Spatial statistics and nearest-neighbour functions
+library(dplyr)            # Data manipulation
+library(tidyr)            # Data reshaping
+library(stringr)          # String operations for parsing file/condition names
+library(purrr)            # Functional programming (map, lapply wrappers)
+library(ggplot2)          # Plotting
+```
+
+---
+
+## 2. Load Cell Metadata
+
+```{r load-cell-data}
+# ============================================================
+# LOAD CELL METADATA FROM ANNDATA OBS CSV
+# ============================================================
+# This CSV is exported from the AnnData object's .obs dataframe and contains
+# spatial coordinates, cell type annotations, and M26 marker status per cell.
+
+cell_df <- read.csv("/Users/victoireringler/Documents/Singapore/Thesis/adata_obs.csv")
+
+# Keep only the columns needed for spatial analysis
+cell_df <- cell_df[, c("x", "y", "condition", "cell_type_annotation", "M26")]
+
+# Parse Image_ID from the condition string by stripping the trailing
+# coordinate bracket suffix, e.g.:
+#   "CT20-09 A1_040625_Core[1,1,A]_[7546,39932]" -> "CT20-09 A1_040625_Core[1,1,A]"
+# This allows matching cells to their corresponding RDS point pattern files.
+cell_df <- cell_df %>%
+  mutate(
+    Image_ID = str_replace(
+      as.character(condition),
+      "_\\[.*\\]$",   # Remove trailing _[x,y] coordinate suffix
+      ""
+    )
+  ) %>%
+  select(x, y, Image_ID, cell_type_annotation, M26)
+
+head(cell_df)
+```
+
+---
+
+## 3. Load Spatial Point Patterns & Annotate Marks
+
+```{r load-ppp-files}
+# ============================================================
+# HELPER: REPLACE PPP MARKS WITH CELL TYPE + M26 STATUS
+# ============================================================
+# Each RDS file is a spatstat ppp object whose marks need to be replaced
+# with a combined label:
+#   - Malignant B cells with M26 == "M+2+6-"  -> "Malignant_B_M26"
+#   - All other Malignant B cells              -> "Malignant_B_other"
+#   - All other cell types                     -> their original annotation
+
+replace_ppp_marks <- function(ppp_obj, cell_df, Image_ID) {
+  # Subset cell metadata to the current core
+  df_core <- cell_df %>% filter(Image_ID == Image_ID)
+
+  # Extract spatial coordinates from the ppp object for matching
+  ppp_df <- data.frame(x = ppp_obj$x, y = ppp_obj$y)
+
+  # Join cell metadata by exact x,y coordinate match
+  joined <- left_join(ppp_df, df_core, by = c("x", "y"))
+
+  # Create combined mark label
+  joined <- joined %>%
+    mutate(
+      new_mark = case_when(
+        cell_type_annotation == "Malignant B cell" & M26 == "M+2+6-" ~ "Malignant_B_M26",
+        cell_type_annotation == "Malignant B cell"                    ~ "Malignant_B_other",
+        TRUE                                                           ~ cell_type_annotation
+      )
+    )
+
+  marks(ppp_obj) <- factor(joined$new_mark)
+  ppp_obj
+}
+
+# ============================================================
+# LOAD ALL RDS FILES AND ANNOTATE
+# ============================================================
+ppp_files <- list.files(
+  "/Users/victoireringler/Documents/Singapore/Thesis/BCC_PatternExtract/M26/final/",
+  pattern    = "\\.[rR][dD][sS]$",
+  full.names = TRUE
+)
+
+ppp_list <- lapply(ppp_files, function(f) {
+  # Parse Image_ID from filename (same stripping logic as for cell_df)
+  condition <- tools::file_path_sans_ext(basename(f))
+  Image_ID  <- str_replace(condition, "_\\[.*\\]$", "")
+
+  ppp <- readRDS(f)
+  replace_ppp_marks(ppp_obj = ppp, cell_df = cell_df, Image_ID = Image_ID)
+})
+
+# Name list elements by Image_ID for easy lookup downstream
+names(ppp_list) <- sapply(ppp_files, function(f) {
+  condition <- tools::file_path_sans_ext(basename(f))
+  str_replace(condition, "_\\[.*\\]$", "")
+})
+```
+
+---
+
+## 4. Compute k-Nearest Neighbour Proportions
+
+```{r calculate-proportions}
+# ============================================================
+# KNN NEIGHBOURHOOD COMPOSITION
+# ============================================================
+k <- 50  # Number of nearest neighbours to consider per cell
+
+# Collect all unique cell types across all cores for a consistent column set
+unique_types_all <- unique(unlist(lapply(ppp_list, function(ppp) marks(ppp))))
+
+# Remove cells with NA marks (can occur if coordinate matching failed)
+sanitize_ppp <- function(ppp_obj) {
+  keep <- !is.na(marks(ppp_obj))
+  ppp_obj[keep]
+}
+ppp_list <- map(ppp_list, sanitize_ppp)
+
+# For each core, compute the proportion of each cell type
+# among the k nearest neighbours of every cell.
+proportions_list <- lapply(ppp_list, function(ppp_obj) {
+
+  # nn_idx: matrix of shape (n_cells × k), each row = indices of k nearest neighbours
+  nn_idx <- nnwhich(ppp_obj, k = 1:k)
+
+  # nn_types: matrix of shape (n_cells × k), each entry = cell type of that neighbour
+  nn_types <- apply(nn_idx, 2, function(col) as.character(marks(ppp_obj)[col]))
+
+  # prop_mat: matrix of shape (n_cells × n_cell_types)
+  # Each row = proportion of each cell type among the k neighbours of that cell
+  prop_mat <- t(apply(nn_types, 1, function(neighbors) {
+    sapply(unique_types_all, function(t) mean(neighbors == t))
+  }))
+
+  colnames(prop_mat) <- unique_types_all
+  prop_mat
+})
+```
+
+---
+
+## 5. Calculate Mean Proportions and Δ% per Core
+
+```{r calculate-delta}
+# ============================================================
+# DELTA % = LOCAL NEIGHBOURHOOD PROPORTION - GLOBAL CORE PROPORTION
+# ============================================================
+# For each focal cell type in a core:
+#   - mean_neighbor_proportion: average proportion of each neighbour cell type
+#     among the k nearest neighbours of all focal cells
+#   - overall_proportion: global frequency of that neighbour cell type in the core
+#   - delta_percent: difference (positive = locally enriched, negative = depleted)
+#   - delta_percent_abs: absolute difference (magnitude of enrichment regardless of direction)
+
+calculate_mean_proportions <- function(ppp_obj, prop_mat) {
+  cell_types  <- as.character(marks(ppp_obj))
+  focal_types <- unique(cell_types)
+
+  # Global cell type frequencies in this core
+  overall_props_table <- table(cell_types) / length(cell_types)
+
+  # Ensure all possible cell types are represented (fill missing with 0)
+  all_cell_types <- colnames(prop_mat)
+  overall_props  <- setNames(rep(0, length(all_cell_types)), all_cell_types)
+  overall_props[names(overall_props_table)] <- as.numeric(overall_props_table)
+
+  # Compute per-focal-type summary
+  results <- lapply(focal_types, function(focal_type) {
+    focal_idx <- which(cell_types == focal_type)
+    if (length(focal_idx) == 0) return(NULL)
+
+    # Average neighbour composition for cells of this focal type
+    neighbor_props <- colMeans(prop_mat[focal_idx, , drop = FALSE])
+
+    # Retrieve matching global proportions
+    overall_for_neighbors <- overall_props[names(neighbor_props)]
+
+    data.frame(
+      focal_cell_type          = focal_type,
+      neighbor_cell_type       = names(neighbor_props),
+      mean_neighbor_proportion = as.numeric(neighbor_props),
+      overall_proportion       = as.numeric(overall_for_neighbors),
+      delta_percent_abs        = abs(neighbor_props - overall_for_neighbors),
+      delta_percent            = neighbor_props - overall_for_neighbors,
+      stringsAsFactors         = FALSE,
+      row.names                = NULL
+    )
+  })
+
+  bind_rows(results)
+}
+
+# Run for all cores and combine into a single long-format data frame
+mean_proportions_by_core <- lapply(names(ppp_list), function(core_name) {
+  result          <- calculate_mean_proportions(ppp_list[[core_name]],
+                                                proportions_list[[core_name]])
+  result$Image_ID <- core_name
+  result
+})
+
+all_mean_proportions <- bind_rows(mean_proportions_by_core)
+```
+
+---
+
+## 6A. Primary vs Relapse Analysis
+
+### Load & Filter Metadata
+
+```{r load-metadata-occurrence}
+# ============================================================
+# METADATA: BIOPSY OCCURRENCE (PRIMARY vs RELAPSE)
+# ============================================================
+metadata <- read_xlsx("/Users/victoireringler/Documents/Singapore/Thesis/BCC_mIHC_analysis/survival_ci_per_core.xlsx")
+
+# Restrict to R-CHOP-based frontline treatment regimens (standard of care for DLBCL)
+treatments_kept <- c(
+  'CHOP6-RITU', 'CHOP4-RITU', 'CHOP8-RITU', 'CHOP6-RITU-RAD', 'CHOP3-RITU-RAD',
+  'CHOP6-RITU-RITUMAIN', 'CHOP-RITU', 'RAD-CHOP6-RITU', 'CHOP1-RITU-DA-EPOCH5-RITU',
+  'CHOP6-RITU-HDMETH-SURG', 'CHOP7-RITU', 'CHOP6-RITU-RITUMAIN2', 'CHOP4-RITU-GDP6-RAD',
+  'CHOP6-RITU-GDP1-REFU', 'CHOP6-RITU-HDMETH4', 'SURG-CHOP3-RITU', 'CHOP6-RITU-HDMETH3',
+  'CHOP6-RITU-HDMETH-RITUMAIN4', 'CHOP6-RITU-RITUMAIN8', 'CHOP4-RITU-ICE2-RITU'
+)
+
+metadata_filt <- metadata %>%
+  filter(
+    Path               == "DLBC",
+    Biopsy_Occurrence  %in% c("Primary", "Relapse"),
+    `Front line treatment (regimen)` %in% treatments_kept,
+    clustering_index   <= 50           # Exclude extreme outlier cores
+  )
+
+# Lookup table: Image_ID -> Biopsy_Occurrence + clustering_index
+core_to_occurrence <- metadata_filt %>%
+  select(Image_ID, Biopsy_Occurrence, clustering_index)
+
+print("Biopsy Occurrence group distribution:")
+print(table(metadata_filt$Biopsy_Occurrence))
+```
+
+### Merge Metadata
+
+```{r merge-metadata-occurrence}
+# Inner join: only keep cores present in both the ppp data and filtered metadata
+all_mean_proportions_with_meta <- all_mean_proportions %>%
+  inner_join(core_to_occurrence, by = "Image_ID")
+
+cat("\nCores kept:", length(unique(all_mean_proportions_with_meta$Image_ID)),
+    "out of", length(unique(all_mean_proportions$Image_ID)), "total cores\n")
+
+excluded_cores <- setdiff(unique(all_mean_proportions$Image_ID),
+                          unique(all_mean_proportions_with_meta$Image_ID))
+if (length(excluded_cores) > 0) {
+  cat("Excluded cores (not in metadata_filt):", length(excluded_cores), "\n")
+}
+```
+
+### Summary Statistics
+
+```{r summary-occurrence}
+# Overall summary (pooled across all cores)
+summary_proportions_overall <- all_mean_proportions_with_meta %>%
+  group_by(focal_cell_type, neighbor_cell_type) %>%
+  summarise(
+    mean_neighbor_prop_across_cores = mean(mean_neighbor_proportion, na.rm = TRUE),
+    sd_neighbor_prop                = sd(mean_neighbor_proportion,   na.rm = TRUE),
+    mean_overall_prop_across_cores  = mean(overall_proportion,       na.rm = TRUE),
+    mean_delta_percent_abs          = mean(delta_percent_abs,        na.rm = TRUE),
+    mean_delta_percent              = mean(delta_percent,            na.rm = TRUE),
+    sd_delta_percent                = sd(delta_percent,              na.rm = TRUE),
+    sd_delta_percent_abs            = sd(delta_percent_abs,          na.rm = TRUE),
+    n_cores                         = n(),
+    .groups = "drop"
+  )
+
+# Stratified summary: Primary vs Relapse
+summary_proportions_by_occurrence <- all_mean_proportions_with_meta %>%
+  filter(Biopsy_Occurrence %in% c("Primary", "Relapse")) %>%
+  group_by(focal_cell_type, neighbor_cell_type, Biopsy_Occurrence) %>%
+  summarise(
+    mean_neighbor_prop   = mean(mean_neighbor_proportion, na.rm = TRUE),
+    sd_neighbor_prop     = sd(mean_neighbor_proportion,   na.rm = TRUE),
+    mean_overall_prop    = mean(overall_proportion,       na.rm = TRUE),
+    mean_delta_percent   = mean(delta_percent,            na.rm = TRUE),
+    mean_delta_percent_abs = mean(delta_percent_abs,      na.rm = TRUE),
+    sd_delta_percent     = sd(delta_percent,              na.rm = TRUE),
+    sd_delta_percent_abs = sd(delta_percent_abs,          na.rm = TRUE),
+    n_cores              = n(),
+    .groups = "drop"
+  )
+
+print(summary_proportions_overall)
+print(summary_proportions_by_occurrence)
+```
+
+### Histogram Plots — Primary vs Relapse
+
+```{r plot-occurrence}
+# ============================================================
+# VISUALISE NEIGHBOURHOOD DISTRIBUTIONS: PRIMARY vs RELAPSE
+# ============================================================
+# Three plots per focal-neighbour pair:
+#   p1 — raw mean neighbour proportion
+#   p2 — absolute Δ% (magnitude of enrichment)
+#   p3 — signed Δ%  (direction: enriched = positive, depleted = negative)
+
+plot_data <- all_mean_proportions_with_meta %>%
+  filter(Biopsy_Occurrence %in% c("Primary", "Relapse"))
+
+focal_cell    <- "Malignant_B_M26"  # Focal cell type (adjust as needed)
+neighbor_cell <- "Treg"             # Neighbour cell type (adjust as needed)
+
+plot_data_specific <- plot_data %>%
+  filter(focal_cell_type  == focal_cell,
+         neighbor_cell_type == neighbor_cell)
+
+occurrence_colours      <- c("Primary" = '#6B8E23', "Relapse" = '#D97706')
+occurrence_colours_dark <- c("Primary" = '#536F1C', "Relapse" = '#B05F05')
+
+if (nrow(plot_data_specific) > 0) {
+
+  # --- p1: Mean neighbour proportion ---
+  p1 <- ggplot(plot_data_specific,
+               aes(x = mean_neighbor_proportion, fill = Biopsy_Occurrence,
+                   color = Biopsy_Occurrence)) +
+    geom_histogram(alpha = 0.4, position = "identity", bins = 50,
+                   aes(y = after_stat(density))) +
+    geom_density(alpha = 0.2, linewidth = 1.2) +
+    scale_fill_manual(values  = occurrence_colours) +
+    scale_color_manual(values = occurrence_colours_dark) +
+    labs(
+      title    = paste("Distribution of", neighbor_cell, "proportions around", focal_cell),
+      subtitle = "Primary vs Relapse cores (with KDE)",
+      x        = "Mean neighbour proportion",
+      y        = "Density",
+      fill     = "Biopsy Occurrence",
+      color    = "Biopsy Occurrence"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 12), legend.position = "top")
+  print(p1)
+
+  # --- p2: Absolute Δ% ---
+  p2 <- ggplot(plot_data_specific,
+               aes(x = delta_percent_abs, fill = Biopsy_Occurrence,
+                   color = Biopsy_Occurrence)) +
+    geom_histogram(alpha = 0.4, position = "identity", bins = 50,
+                   aes(y = after_stat(density))) +
+    geom_density(alpha = 0.2, linewidth = 1.2) +
+    scale_fill_manual(values  = occurrence_colours) +
+    scale_color_manual(values = occurrence_colours_dark) +
+    labs(
+      title    = paste("Distribution of |Δ%| for", neighbor_cell, "around", focal_cell),
+      subtitle = "Primary vs Relapse cores (with KDE)",
+      x        = "Δ% (|Local proportion − Global proportion|)",
+      y        = "Density",
+      fill     = "Biopsy Occurrence",
+      color    = "Biopsy Occurrence"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 12), legend.position = "top")
+  print(p2)
+
+  # --- p3: Signed Δ% (zoomed to ±0.02 to focus on the main distribution) ---
+  p3 <- ggplot(plot_data_specific,
+               aes(x = delta_percent, fill = Biopsy_Occurrence,
+                   color = Biopsy_Occurrence)) +
+    geom_histogram(alpha = 0.4, position = "identity", bins = 100,
+                   aes(y = after_stat(density))) +
+    geom_density(alpha = 0.2, linewidth = 1.2) +
+    scale_fill_manual(values  = occurrence_colours) +
+    scale_color_manual(values = occurrence_colours_dark) +
+    coord_cartesian(xlim = c(-0.02, 0.02)) +
+    labs(
+      title    = paste("Distribution of signed Δ% for", neighbor_cell, "around", focal_cell),
+      subtitle = "Primary vs Relapse cores (with KDE)",
+      x        = "Δ% (Local proportion − Global proportion)",
+      y        = "Density",
+      fill     = "Biopsy Occurrence",
+      color    = "Biopsy Occurrence"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 12), legend.position = "top")
+  print(p3)
+
+  # Print per-group summary statistics
+  cat("\nSummary statistics for", focal_cell, "→", neighbor_cell, ":\n")
+  plot_data_specific %>%
+    group_by(Biopsy_Occurrence) %>%
+    summarise(
+      n_cores                  = n(),
+      mean_proportion          = mean(mean_neighbor_proportion, na.rm = TRUE),
+      median_proportion        = median(mean_neighbor_proportion, na.rm = TRUE),
+      mean_delta_percent_abs   = mean(delta_percent_abs,  na.rm = TRUE),
+      median_delta_percent_abs = median(delta_percent_abs, na.rm = TRUE),
+      mean_delta_percent       = mean(delta_percent,       na.rm = TRUE),
+      median_delta_percent     = median(delta_percent,     na.rm = TRUE)
+    ) %>%
+    print()
+
+} else {
+  cat("No data found for focal:", focal_cell, "| neighbour:", neighbor_cell, "\n")
+  cat("Available focal types:\n");    print(unique(plot_data$focal_cell_type))
+  cat("Available neighbour types:\n"); print(unique(plot_data$neighbor_cell_type))
+}
+```
+
+### Save Plots — Primary vs Relapse
+
+```{r save-plots-occurrence}
+out_dir <- "/Users/victoireringler/Documents/Singapore/Thesis/cell_distance_analysis/Final_figures/"
+
+ggsave(file.path(out_dir, "Histogram_mean_neighbor_proportion_Treg.pdf"),
+       plot = p1, device = "pdf", width = 8, height = 6, units = "in", dpi = 300)
+
+ggsave(file.path(out_dir, "Histogram_delta_percent_abs_Treg.pdf"),
+       plot = p2, device = "pdf", width = 8, height = 6, units = "in", dpi = 300)
+
+ggsave(file.path(out_dir, "Histogram_delta_percent_signed_Treg.pdf"),
+       plot = p3, device = "pdf", width = 8, height = 6, units = "in", dpi = 300)
+
+cat("Primary vs Relapse plots saved.\n")
+```
+
+---
+
+## 6B. Dispersed vs Clustered Analysis (Primary Biopsies Only)
+
+Cores are stratified into tertiles of the **clustering index**:
+- **Dispersed** — lowest tertile (most spatially dispersed tumour cells)
+- **IQR** — middle tertile (excluded from comparisons)
+- **Clustered** — highest tertile (most spatially clustered tumour cells)
+
+### Load & Filter Metadata
+
+```{r load-metadata-cluster}
+metadata <- read_xlsx("/Users/victoireringler/Documents/Singapore/Thesis/BCC_mIHC_analysis/survival_ci_per_core.xlsx")
+
+# Same treatment filter as above; restrict to Primary biopsies only
+metadata_filt <- metadata %>%
+  filter(
+    Path              == "DLBC",
+    Biopsy_Occurrence == "Primary",
+    `Front line treatment (regimen)` %in% treatments_kept,
+    clustering_index  <= 50
+  )
+
+# Assign tertile-based cluster group labels
+vTert <- quantile(metadata_filt$clustering_index, c(0:3/3))
+metadata_filt$cluster_group <- with(
+  metadata_filt,
+  cut(clustering_index, vTert, include.lowest = TRUE,
+      labels = c("Dispersed", "IQR", "Clustered"))
+)
+
+core_to_cluster <- metadata_filt %>%
+  select(Image_ID, cluster_group, clustering_index)
+
+print("Cluster group distribution:")
+print(table(metadata_filt$cluster_group))
+```
+
+### Merge Metadata
+
+```{r merge-metadata-cluster}
+all_mean_proportions_with_meta <- all_mean_proportions %>%
+  inner_join(core_to_cluster, by = "Image_ID") %>%
+  filter(!is.na(cluster_group))
+
+cat("\nCores kept:", length(unique(all_mean_proportions_with_meta$Image_ID)),
+    "out of", length(unique(all_mean_proportions$Image_ID)), "total cores\n")
+
+excluded_cores <- setdiff(unique(all_mean_proportions$Image_ID),
+                          unique(all_mean_proportions_with_meta$Image_ID))
+if (length(excluded_cores) > 0) {
+  cat("Excluded cores (not in metadata_filt):", length(excluded_cores), "\n")
+}
+```
+
+### Summary Statistics
+
+```{r summary-cluster}
+# Overall summary (pooled)
+summary_proportions_overall <- all_mean_proportions_with_meta %>%
+  group_by(focal_cell_type, neighbor_cell_type) %>%
+  summarise(
+    mean_neighbor_prop_across_cores = mean(mean_neighbor_proportion, na.rm = TRUE),
+    sd_neighbor_prop                = sd(mean_neighbor_proportion,   na.rm = TRUE),
+    mean_overall_prop_across_cores  = mean(overall_proportion,       na.rm = TRUE),
+    mean_delta_percent_abs          = mean(delta_percent_abs,        na.rm = TRUE),
+    mean_delta_percent              = mean(delta_percent,            na.rm = TRUE),
+    sd_delta_percent                = sd(delta_percent,              na.rm = TRUE),
+    sd_delta_percent_abs            = sd(delta_percent_abs,          na.rm = TRUE),
+    n_cores                         = n(),
+    .groups = "drop"
+  )
+
+# Stratified summary: Dispersed vs Clustered (IQR excluded)
+summary_proportions_by_cluster <- all_mean_proportions_with_meta %>%
+  filter(cluster_group %in% c("Dispersed", "Clustered")) %>%
+  group_by(focal_cell_type, neighbor_cell_type, cluster_group) %>%
+  summarise(
+    mean_neighbor_prop     = mean(mean_neighbor_proportion, na.rm = TRUE),
+    sd_neighbor_prop       = sd(mean_neighbor_proportion,   na.rm = TRUE),
+    mean_overall_prop      = mean(overall_proportion,       na.rm = TRUE),
+    mean_delta_percent     = mean(delta_percent,            na.rm = TRUE),
+    mean_delta_percent_abs = mean(delta_percent_abs,        na.rm = TRUE),
+    sd_delta_percent       = sd(delta_percent,              na.rm = TRUE),
+    sd_delta_percent_abs   = sd(delta_percent_abs,          na.rm = TRUE),
+    n_cores                = n(),
+    .groups = "drop"
+  )
+
+print(summary_proportions_overall)
+print(summary_proportions_by_cluster)
+```
+
+### Histogram Plots — Dispersed vs Clustered
+
+```{r plot-cluster}
+# ============================================================
+# VISUALISE NEIGHBOURHOOD DISTRIBUTIONS: DISPERSED vs CLUSTERED
+# ============================================================
+plot_data <- all_mean_proportions_with_meta %>%
+  filter(cluster_group %in% c("Dispersed", "Clustered"))
+
+focal_cell    <- "Malignant_B_M26"  # Focal cell type (adjust as needed)
+neighbor_cell <- "T cell"           # Neighbour cell type (adjust as needed)
+
+plot_data_specific <- plot_data %>%
+  filter(focal_cell_type   == focal_cell,
+         neighbor_cell_type == neighbor_cell)
+
+cluster_colours      <- c("Dispersed" = "#a6224d", "Clustered" = "#82b4da")
+cluster_colours_dark <- c("Dispersed" = "#7f1a3b", "Clustered" = "#4a6f99")
+
+if (nrow(plot_data_specific) > 0) {
+
+  cat("Number of cores per group:\n")
+  print(plot_data_specific %>% group_by(cluster_group) %>% summarise(n_cores = n()))
+
+  # --- p1: Mean neighbour proportion ---
+  p1 <- ggplot(plot_data_specific,
+               aes(x = mean_neighbor_proportion, fill = cluster_group,
+                   color = cluster_group)) +
+    geom_histogram(alpha = 0.4, position = "identity", bins = 50,
+                   aes(y = after_stat(density))) +
+    geom_density(alpha = 0.2, linewidth = 1.2) +
+    scale_fill_manual(values  = cluster_colours) +
+    scale_color_manual(values = cluster_colours_dark) +
+    labs(
+      title    = paste("Distribution of", neighbor_cell, "proportions around", focal_cell),
+      subtitle = "Dispersed vs Clustered cores (with KDE)",
+      x        = "Mean neighbour proportion",
+      y        = "Density",
+      fill     = "Cluster group",
+      color    = "Cluster group"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 12), legend.position = "top")
+  print(p1)
+
+  # --- p2: Absolute Δ% ---
+  p2 <- ggplot(plot_data_specific,
+               aes(x = delta_percent_abs, fill = cluster_group,
+                   color = cluster_group)) +
+    geom_histogram(alpha = 0.4, position = "identity", bins = 50,
+                   aes(y = after_stat(density))) +
+    geom_density(alpha = 0.2, linewidth = 1.2) +
+    scale_fill_manual(values  = cluster_colours) +
+    scale_color_manual(values = cluster_colours_dark) +
+    labs(
+      title    = paste("Distribution of |Δ%| for", neighbor_cell, "around", focal_cell),
+      subtitle = "Dispersed vs Clustered cores (with KDE)",
+      x        = "Δ% (|Local proportion − Global proportion|)",
+      y        = "Density",
+      fill     = "Cluster group",
+      color    = "Cluster group"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 12), legend.position = "top")
+  print(p2)
+
+  # --- p3: Signed Δ% (zoomed to ±0.02) ---
+  p3 <- ggplot(plot_data_specific,
+               aes(x = delta_percent, fill = cluster_group,
+                   color = cluster_group)) +
+    geom_histogram(alpha = 0.4, position = "identity", bins = 100,
+                   aes(y = after_stat(density))) +
+    geom_density(alpha = 0.2, linewidth = 1.2) +
+    scale_fill_manual(values  = cluster_colours) +
+    scale_color_manual(values = cluster_colours_dark) +
+    coord_cartesian(xlim = c(-0.02, 0.02)) +
+    labs(
+      title    = paste("Distribution of signed Δ% for", neighbor_cell, "around", focal_cell),
+      subtitle = "Dispersed vs Clustered cores (with KDE)",
+      x        = "Δ% (Local proportion − Global proportion)",
+      y        = "Density",
+      fill     = "Cluster group",
+      color    = "Cluster group"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 12), legend.position = "top")
+  print(p3)
+
+  # Print per-group summary statistics
+  cat("\nSummary statistics for", focal_cell, "→", neighbor_cell, ":\n")
+  plot_data_specific %>%
+    group_by(cluster_group) %>%
+    summarise(
+      n_cores                  = n(),
+      mean_proportion          = mean(mean_neighbor_proportion, na.rm = TRUE),
+      median_proportion        = median(mean_neighbor_proportion, na.rm = TRUE),
+      mean_delta_percent_abs   = mean(delta_percent_abs,  na.rm = TRUE),
+      median_delta_percent_abs = median(delta_percent_abs, na.rm = TRUE),
+      mean_delta_percent       = mean(delta_percent,       na.rm = TRUE),
+      median_delta_percent     = median(delta_percent,     na.rm = TRUE)
+    ) %>%
+    print()
+
+} else {
+  cat("No data found for focal:", focal_cell, "| neighbour:", neighbor_cell, "\n")
+  cat("Available focal types:\n");     print(unique(plot_data$focal_cell_type))
+  cat("Available neighbour types:\n"); print(unique(plot_data$neighbor_cell_type))
+}
+```
+
+### Save Plots — Dispersed vs Clustered
+
+```{r save-plots-cluster}
+out_dir <- "/Users/victoireringler/Documents/Singapore/Thesis/cell_distance_analysis/Final_figures/"
+
+ggsave(file.path(out_dir, "Histogram_mean_neighbor_proportion_primary_Tcell.pdf"),
+       plot = p1, device = "pdf", width = 8, height = 6, units = "in", dpi = 300)
+
+ggsave(file.path(out_dir, "Histogram_delta_percent_abs_primary_Tcell.pdf"),
+       plot = p2, device = "pdf", width = 8, height = 6, units = "in", dpi = 300)
+
+ggsave(file.path(out_dir, "Histogram_delta_percent_signed_primary_Tcell.pdf"),
+       plot = p3, device = "pdf", width = 8, height = 6, units = "in", dpi = 300)
+
+cat("Dispersed vs Clustered plots saved.\n")
+```
